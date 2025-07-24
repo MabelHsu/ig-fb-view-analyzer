@@ -4,7 +4,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="IG / FB Reels 平均觀看分析", layout="centered")
 
-st.title("IG / FB Reels Videos 平均觀看數🖩")
+st.title("IG / FB 影片平均觀看數計算")
 st.markdown("上傳 Meta IG 或 FB 報表（CSV），選擇分析期間，自動顯示 Reels 和 Videos 的影片數量、總觀看數、平均觀看數。")
 
 # 上傳 CSV
