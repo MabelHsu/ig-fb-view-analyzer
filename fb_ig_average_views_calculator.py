@@ -1,67 +1,202 @@
 import streamlit as st
-import pandas as pd0
-from datetime import datetime
+import pandas as pd
+from datetime import date, timedelta
+from typing import Optional, List
 
 st.set_page_config(page_title="IG / FB Reels 平均觀看分析", layout="centered")
 
 st.title("IG / FB 影片平均觀看數計算")
-st.markdown("上傳 Meta IG 或 FB 報表（CSV），選擇分析期間，自動顯示 Reels 和 Videos 的影片數量、總觀看數、平均觀看數。")
+st.markdown(
+    "上傳 Meta IG 或 FB 報表（CSV），選擇分析期間，自動顯示 Reels 和 Videos 的影片數量、總觀看數、平均觀看數。"
+)
 
-# 上傳 CSV
-uploaded_file = st.file_uploader("📁 上傳 CSV 檔案", type="csv")
+# 1) 檔案上傳
+uploaded_file = st.file_uploader("上傳 CSV 檔案", type=["csv"])
 
-# 日期輸入
+# 2) 日期區間（預設今天與今天+7）
 start_date = st.date_input("開始日期", date.today())
 end_date = st.date_input("結束日期", date.today() + timedelta(days=7))
 
-def analisar_rede_social_auto(df, data_inicio, data_fim):
-    df["Publish time"] = pd.to_datetime(df["Publish time"], errors="coerce")
-    data_inicio = pd.to_datetime(data_inicio)
-    data_fim = pd.to_datetime(data_fim)
-    df = df[(df["Publish time"] >= data_inicio) & (df["Publish time"] <= data_fim)]
+if end_date < start_date:
+    st.error("結束日期不可早於開始日期。")
+    st.stop()
 
-    # 自動判斷平台
-    if "Page name" in df.columns and "Permalink" in df.columns:
-        plataforma = "facebook"
-        df["Tipo"] = df["Permalink"].apply(
-            lambda x: "Reel" if "/reel/" in str(x) else "Video" if "/videos/" in str(x) else "Outro"
-        )
-    elif "Account name" in df.columns and "Post type" in df.columns:
-        plataforma = "instagram"
-        df["Tipo"] = df["Post type"].apply(
-            lambda x: "Reel" if str(x).strip().lower() == "ig reel" else "Outro"
-        )
+# --------- 工具函式 --------- #
+DATE_CANDIDATES: List[str] = [
+    "Publish time",
+    "Publish date",
+    "Published",
+    "Date",
+    "Created time",
+    "Created Time",
+    "Created At",
+    "Post Created Date",
+]
+
+VIEW_CANDIDATES: List[str] = [
+    "Views",
+    "Video views",
+    "Plays",
+    "Video plays",
+    "Lifetime total video views",
+    "Lifetime Post total video views",
+    "Lifetime Video Views",
+]
+
+
+def find_date_column(df: pd.DataFrame) -> Optional[str]:
+    # 先嘗試固定候選
+    for c in DATE_CANDIDATES:
+        if c in df.columns:
+            return c
+    # 再嘗試以關鍵字模糊尋找
+    lower = {c.lower(): c for c in df.columns}
+    for key in lower:
+        if ("publish" in key or "created" in key or key == "date") and (
+            "time" in key or "date" in key or key in ("date",)
+        ):
+            return lower[key]
+    return None
+
+
+def find_view_candidates(df: pd.DataFrame) -> List[str]:
+    # 以固定候選 + 關鍵字模糊搜尋
+    found = [c for c in VIEW_CANDIDATES if c in df.columns]
+    # 追加模糊搜尋
+    for col in df.columns:
+        lc = col.lower()
+        if ("view" in lc or "play" in lc) and col not in found:
+            found.append(col)
+    return found
+
+
+def detect_platform(df: pd.DataFrame) -> str:
+    # 粗略偵測：依欄位判斷
+    if "Page name" in df.columns or "Permalink" in df.columns:
+        return "facebook"
+    if "Account name" in df.columns or "Post type" in df.columns:
+        return "instagram"
+    return "unknown"
+
+
+def classify_type_fb(row: pd.Series) -> str:
+    link = str(row.get("Permalink", "")).lower()
+    post_type = str(row.get("Post type", "")).lower()
+    if "/reel" in link:
+        return "Reel"
+    if "/videos" in link or "video" in post_type:
+        return "Video"
+    return "Outro"
+
+
+def classify_type_ig(row: pd.Series) -> str:
+    post_type = str(
+        row.get("Post type", row.get("Content type", ""))
+    ).lower()
+    link = str(row.get("Permalink", "")).lower()
+    if "reel" in post_type or "/reel" in link:
+        return "Reel"
+    if "video" in post_type:
+        return "Video"
+    return "Outro"
+
+
+def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
+    # 1) 解析日期欄位
+    date_col = find_date_column(df)
+    if not date_col:
+        st.error("找不到日期欄位，請確認報表是否包含 Publish time / Publish date / Created time 等欄位。")
+        return
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+    if df[date_col].isna().all():
+        st.error(f"日期欄位「{date_col}」無法解析為日期時間。")
+        return
+
+    # 將使用者選擇的日期區間轉為含當日全日的範圍
+    start_ts = pd.to_datetime(start_d)
+    end_ts = pd.to_datetime(end_d) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+    df = df[(df[date_col] >= start_ts) & (df[date_col] <= end_ts)]
+    if df.empty:
+        st.warning("在選定的日期區間內沒有資料。")
+        return
+
+    # 2) 偵測平台並分類 Reel / Video
+    platform = detect_platform(df)
+
+    if platform == "facebook":
+        df["Tipo"] = df.apply(classify_type_fb, axis=1)
+    elif platform == "instagram":
+        df["Tipo"] = df.apply(classify_type_ig, axis=1)
     else:
-        return "無法判斷平台：缺少必要欄位"
+        st.error("無法判斷平台，請確認報表欄位是否包含 Page name/Permalink 或 Account name/Post type。")
+        return
 
-    # 只保留 Reels
-    df = df[df["Tipo"] == "Reel"]
+    # 僅保留 Reel / Video
+    df = df[df["Tipo"].isin(["Reel", "Video"])]
+    if df.empty:
+        st.warning("區間內沒有 Reel 或 Video 貼文。")
+        return
 
-    if "Views" not in df.columns:
-        return "報表中缺少 'Views' 欄位"
+    # 3) 選擇觀看數欄位
+    view_opts = find_view_candidates(df)
+    if not view_opts:
+        st.error("找不到觀看數欄位，請確認是否包含 Views / Plays / Video views 等欄位。")
+        return
 
-    df = df[pd.to_numeric(df["Views"], errors="coerce").notna()]
-    df["Views"] = df["Views"].astype(float)
+    default_index = view_opts.index("Views") if "Views" in view_opts else 0
+    views_col = st.selectbox("選擇觀看數欄位", view_opts, index=default_index)
 
-    total_views = df["Views"].sum()
-    num_posts = df.shape[0]
-    avg_views = total_views / num_posts if num_posts > 0 else 0
+    # 4) 數值轉換與清理
+    df[views_col] = pd.to_numeric(df[views_col], errors="coerce")
+    df = df[df[views_col].notna()]
+    if df.empty:
+        st.warning(f"欄位「{views_col}」在區間內沒有可用的數值。")
+        return
 
-    return f"""
-✅ 平台：{plataforma.capitalize()}
-📅 區間：{data_inicio.date()} 到 {data_fim.date()}
-🎞️ Reels 貼文數量：{num_posts}
-👀 總觀看數：{int(total_views):,}
-📊 平均觀看數：{round(avg_views, 2):,}
-""".strip()
+    # 5) 彙總統計
+    grouped = (
+        df.groupby("Tipo", as_index=False)[views_col]
+        .agg(貼文數量="count", 總觀看數="sum")
+        .sort_values("Tipo")
+    )
+    grouped["平均觀看數"] = grouped["總觀看數"] / grouped["貼文數量"]
+    grouped["總觀看數"] = grouped["總觀看數"].round(0).astype(int)
+    grouped["平均觀看數"] = grouped["平均觀看數"].round(2)
 
-# 執行分析
+    # 6) 顯示結果
+    st.subheader("分析結果")
+    st.write(f"平台：{platform.capitalize()}")
+    st.write(f"區間：{start_d} 到 {end_d}")
+    st.write(f"日期欄位：{date_col}")
+    st.write(f"觀看數欄位：{views_col}")
+
+    st.dataframe(grouped, use_container_width=True)
+
+    # 額外提供明細下載（可選）
+    with st.expander("下載區間內的明細（依選擇的欄位整理）"):
+        cols_to_show = [date_col, views_col, "Tipo"]
+        extra_cols = [c for c in ["Page name", "Account name", "Permalink", "Post type", "Content type", "Title"] if c in df.columns]
+        detail = df[cols_to_show + extra_cols].sort_values(date_col, ascending=False).copy()
+        csv = detail.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("下載 CSV", csv, file_name="filtered_details.csv", mime="text/csv")
+        st.dataframe(detail.head(50), use_container_width=True)
+
+
+# --------- 主流程 --------- #
 if uploaded_file is not None:
-    with st.spinner("正在分析中..."):
-        try:
-            df = pd.read_csv(uploaded_file)
-            resultado = analisar_rede_social_auto(df, start_date, end_date)
-            st.success("分析完成")
-            st.text(resultado)
-        except Exception as e:
-            st.error(f"分析時發生錯誤：{e}")
+    try:
+        df = pd.read_csv(uploaded_file)
+    except UnicodeDecodeError:
+        # 若是 Excel 匯出的 CSV 可能需要指定編碼
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+    except Exception as e:
+        st.error(f"讀取 CSV 時發生錯誤：{e}")
+        st.stop()
+
+    with st.spinner("分析中..."):
+        analyze(df, start_date, end_date)
+else:
+    st.info("請先上傳 CSV 檔案。")
