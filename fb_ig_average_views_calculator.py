@@ -1,5 +1,5 @@
 import streamlit as st
-import pandas as pd
+import pandas as pd0
 from datetime import datetime
 
 st.set_page_config(page_title="IG / FB Reels 平均觀看分析", layout="centered")
@@ -11,8 +11,8 @@ st.markdown("上傳 Meta IG 或 FB 報表（CSV），選擇分析期間，自動
 uploaded_file = st.file_uploader("📁 上傳 CSV 檔案", type="csv")
 
 # 日期輸入
-start_date = st.date_input("開始日期", datetime(2025, 6, 26))
-end_date = st.date_input("結束日期", datetime(2025, 7, 23))
+start_date = st.date_input("開始日期", date.today())
+end_date = st.date_input("結束日期", date.today() + timedelta(days=7))
 
 def analisar_rede_social_auto(df, data_inicio, data_fim):
     df["Publish time"] = pd.to_datetime(df["Publish time"], errors="coerce")
