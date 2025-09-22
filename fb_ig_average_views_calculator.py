@@ -13,9 +13,9 @@ st.markdown(
 # 1) 檔案上傳
 uploaded_file = st.file_uploader("上傳 CSV 檔案", type=["csv"])
 
-# 2) 日期區間（預設今天與今天+7）
-start_date = st.date_input("開始日期", date.today())
-end_date = st.date_input("結束日期", date.today() + timedelta(days=7))
+# 2) 日期區間（預設今天與今天-7）
+start_date = st.date_input("開始日期", date.today() - timedelta(days=7))
+end_date = st.date_input("結束日期", date.today())
 
 if end_date < start_date:
     st.error("結束日期不可早於開始日期。")
