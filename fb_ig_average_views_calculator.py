@@ -48,6 +48,51 @@ VIEW_CANDIDATES: List[str] = [
     "Lifetime Video Views",
 ]
 
+# 以網址網域為主的偵測，失敗再用欄位特徵打分
+def detect_platform(df: pd.DataFrame) -> str:
+    cols = set(df.columns)
+
+    # 1) 先看 Permalink 網域（最可靠）
+    if "Permalink" in cols:
+        s = df["Permalink"].astype(str).str.lower()
+        ig_hits = s.str.contains("instagram.com", na=False).sum()
+        fb_hits = s.str.contains("facebook.com", na=False).sum()
+        # 如果明顯偏向某一方，就回傳
+        if ig_hits > fb_hits and ig_hits > 0:
+            return "instagram"
+        if fb_hits > ig_hits and fb_hits > 0:
+            return "facebook"
+        # 若網址沒有網域資訊，也別急著判定，繼續用欄位特徵來看
+
+    # 2) 欄位特徵打分
+    ig_like = {
+        "Account name", "Username", "Owner", "Owner Name", "Content type",
+        "Media type", "Caption", "IG Post ID", "Instagram post ID",
+        "Insights for Instagram Reels", "Reel audio", "Reel length"
+    }
+    fb_like = {
+        "Page name", "Page ID", "Message", "FB Post ID", "Story ID",
+        "Permalink URL", "Is video", "Post ID", "Lifetime total video views"
+    }
+
+    ig_score = len(ig_like & cols)
+    fb_score = len(fb_like & cols)
+
+    if ig_score > fb_score and ig_score >= 1:
+        return "instagram"
+    if fb_score > ig_score and fb_score >= 1:
+        return "facebook"
+
+    # 3) 最後的安全網：看 Post type / Content type 的值裡是否有 reel/video 字樣
+    sample_cols = [c for c in ["Post type", "Content type"] if c in cols]
+    for c in sample_cols:
+        s = df[c].astype(str).str.lower()
+        if s.str.contains("reel", na=False).sum() > 0 and not s.str.contains("page", na=False).any():
+            # IG 常見有 "reel" 字樣、且不像 FB Page
+            return "instagram"
+
+    return "unknown"
+
 
 def find_date_column(df: pd.DataFrame) -> Optional[str]:
     # 先嘗試固定候選
@@ -67,20 +112,12 @@ def find_date_column(df: pd.DataFrame) -> Optional[str]:
 def find_view_candidates(df: pd.DataFrame) -> List[str]:
     # 以固定候選 + 關鍵字模糊搜尋
     found = [c for c in VIEW_CANDIDATES if c in df.columns]
+    # 追加模糊搜尋
     for col in df.columns:
         lc = col.lower()
         if ("view" in lc or "play" in lc) and col not in found:
             found.append(col)
     return found
-
-
-def detect_platform(df: pd.DataFrame) -> str:
-    # 粗略偵測：依欄位判斷
-    if "Page name" in df.columns or "Permalink" in df.columns:
-        return "facebook"
-    if "Account name" in df.columns or "Post type" in df.columns:
-        return "instagram"
-    return "unknown"
 
 
 def classify_type_fb(row: pd.Series) -> str:
@@ -129,16 +166,20 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         st.warning("在選定的日期區間內沒有資料。")
         return
 
-    # 2) 偵測平台 & 分類
-    platform = detect_platform(df)
+    # 2) 偵測平台（提供手動覆蓋）
+    auto_platform = detect_platform(df)  # 'facebook' | 'instagram' | 'unknown'
+    options = ["facebook", "instagram"]
+    default_idx = 0 if auto_platform == "facebook" else 1
+    if auto_platform == "unknown":
+        st.info("無法可靠判斷資料來源平台，請手動選擇。")
+        default_idx = 0  # 預設選 Facebook，但可自行切換
+    platform = st.selectbox("平台（可手動覆蓋）", options, index=default_idx, help="若自動判斷有誤，請在此切換。")
 
+    # 3) 依平台分類 Reel / Video
     if platform == "facebook":
         df["Tipo"] = df.apply(classify_type_fb, axis=1)
-    elif platform == "instagram":
-        df["Tipo"] = df.apply(classify_type_ig, axis=1)
     else:
-        st.error("無法判斷平台，請確認報表欄位是否包含 Page name/Permalink 或 Account name/Post type。")
-        return
+        df["Tipo"] = df.apply(classify_type_ig, axis=1)
 
     # 僅保留 Reel / Video
     df = df[df["Tipo"].isin(["Reel", "Video"])]
@@ -146,7 +187,7 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         st.warning("區間內沒有 Reel 或 Video 貼文。")
         return
 
-    # 3) 選擇觀看數欄位
+    # 4) 選擇觀看數欄位
     view_opts = find_view_candidates(df)
     if not view_opts:
         st.error("找不到觀看數欄位，請確認是否包含 Views / Plays / Video views 等欄位。")
@@ -154,14 +195,14 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
     default_index = view_opts.index("Views") if "Views" in view_opts else 0
     views_col = st.selectbox("選擇觀看數欄位", view_opts, index=default_index)
 
-    # 4) 數值轉換與清理
+    # 5) 數值轉換與清理
     df[views_col] = pd.to_numeric(df[views_col], errors="coerce")
     df = df[df[views_col].notna()]
     if df.empty:
         st.warning(f"欄位「{views_col}」在區間內沒有可用的數值。")
         return
 
-    # 5) 彙總統計（各類型 + 全部合計）
+    # 6) 彙總統計（各類型 + 全部合計）
     grouped = (
         df.groupby("Tipo", as_index=False)[views_col]
         .agg(貼文數量="count", 總觀看數="sum")
@@ -184,19 +225,17 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         }]
     )
 
-    # 將合計列放在最上方更醒目（也可放在最後）
+    # 合併並顯示
     grouped_with_total = pd.concat([overall_row, grouped], ignore_index=True)
 
-    # 6) 顯示結果
     st.subheader("分析結果")
-    st.write(f"平台：{platform.capitalize()}")
+    st.write(f"平台（自動判斷）：{auto_platform}")
+    st.write(f"平台（實際使用）：{platform}")
     st.write(f"區間：{start_d} 到 {end_d}")
     st.write(f"日期欄位：{date_col}")
     st.write(f"觀看數欄位：{views_col}")
 
-    # 亮點數字
     st.metric("全影片平均觀看數（Reel + Video）", f"{overall_avg:,.2f}")
-
     st.dataframe(grouped_with_total, use_container_width=True)
 
     # 明細下載
@@ -217,7 +256,10 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         st.write("date_col tz:", getattr(df[date_col].dt, "tz", None))
         st.write("start_ts:", start_ts, "tz:", start_ts.tz)
         st.write("end_ts:", end_ts, "tz:", end_ts.tz)
-
+        if "Permalink" in df.columns:
+            s = df["Permalink"].astype(str).str.lower()
+            st.write("instagram.com hits:", int(s.str.contains("instagram.com", na=False).sum()))
+            st.write("facebook.com hits:", int(s.str.contains("facebook.com", na=False).sum()))
 
 # --------- 主流程 --------- #
 if uploaded_file is not None:
