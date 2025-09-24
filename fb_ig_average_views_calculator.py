@@ -67,7 +67,6 @@ def find_date_column(df: pd.DataFrame) -> Optional[str]:
 def find_view_candidates(df: pd.DataFrame) -> List[str]:
     # 以固定候選 + 關鍵字模糊搜尋
     found = [c for c in VIEW_CANDIDATES if c in df.columns]
-    # 追加模糊搜尋
     for col in df.columns:
         lc = col.lower()
         if ("view" in lc or "play" in lc) and col not in found:
@@ -105,34 +104,32 @@ def classify_type_ig(row: pd.Series) -> str:
 
 
 def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
-    # 1) 解析日期欄位
+    # 1) 解析日期欄位（統一 tz-aware）
     date_col = find_date_column(df)
     if not date_col:
         st.error("找不到日期欄位，請確認報表是否包含 Publish time / Publish date / Created time 等欄位。")
         return
 
-    # **關鍵修正**：統一把日期欄位轉為 tz-aware（先轉 UTC，再轉本地時區）
-    # 這樣不論原本是字串、naive datetime、或帶 Z/offset，都能統一比較
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
-    df = df.dropna(subset=[date_col])  # 清除轉換失敗的列，避免後續比較噴錯
+    df = df.dropna(subset=[date_col])
     if df.empty:
         st.error(f"日期欄位「{date_col}」無法解析為日期時間。")
         return
 
-    # 轉到本地時區後再做區間篩選（視覺與報表較直覺）
+    # 轉至當地時區
     df[date_col] = df[date_col].dt.tz_convert(LOCAL_TZ)
 
-    # 將使用者選擇的日期區間轉為「本地時區」的日初/日末（tz-aware）
+    # 使用者區間 -> 當地時區的日初/日末（tz-aware）
     start_ts = pd.Timestamp(datetime.combine(start_d, time.min), tz=LOCAL_TZ)
     end_ts = pd.Timestamp(datetime.combine(end_d, time.max), tz=LOCAL_TZ)
 
-    # 安全比較（雙方同為 tz-aware 且同一時區）
+    # 篩選區間
     df = df[(df[date_col] >= start_ts) & (df[date_col] <= end_ts)]
     if df.empty:
         st.warning("在選定的日期區間內沒有資料。")
         return
 
-    # 2) 偵測平台並分類 Reel / Video
+    # 2) 偵測平台 & 分類
     platform = detect_platform(df)
 
     if platform == "facebook":
@@ -154,7 +151,6 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
     if not view_opts:
         st.error("找不到觀看數欄位，請確認是否包含 Views / Plays / Video views 等欄位。")
         return
-
     default_index = view_opts.index("Views") if "Views" in view_opts else 0
     views_col = st.selectbox("選擇觀看數欄位", view_opts, index=default_index)
 
@@ -165,15 +161,31 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         st.warning(f"欄位「{views_col}」在區間內沒有可用的數值。")
         return
 
-    # 5) 彙總統計
+    # 5) 彙總統計（各類型 + 全部合計）
     grouped = (
         df.groupby("Tipo", as_index=False)[views_col]
         .agg(貼文數量="count", 總觀看數="sum")
         .sort_values("Tipo")
     )
-    grouped["平均觀看數"] = grouped["總觀看數"] / grouped["貼文數量"]
+    grouped["平均觀看數"] = (grouped["總觀看數"] / grouped["貼文數量"]).round(2)
     grouped["總觀看數"] = grouped["總觀看數"].round(0).astype(int)
-    grouped["平均觀看數"] = grouped["平均觀看數"].round(2)
+
+    # ▶ Reel + Video 合計（加權平均 = 總觀看數 / 貼文數量）
+    total_posts = int(df.shape[0])
+    total_views = int(df[views_col].sum())
+    overall_avg = round(total_views / total_posts, 2) if total_posts else 0.0
+
+    overall_row = pd.DataFrame(
+        [{
+            "Tipo": "Reel + Video（合計）",
+            "貼文數量": total_posts,
+            "總觀看數": total_views,
+            "平均觀看數": overall_avg,
+        }]
+    )
+
+    # 將合計列放在最上方更醒目（也可放在最後）
+    grouped_with_total = pd.concat([overall_row, grouped], ignore_index=True)
 
     # 6) 顯示結果
     st.subheader("分析結果")
@@ -182,14 +194,16 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
     st.write(f"日期欄位：{date_col}")
     st.write(f"觀看數欄位：{views_col}")
 
-    st.dataframe(grouped, use_container_width=True)
+    # 亮點數字
+    st.metric("全影片平均觀看數（Reel + Video）", f"{overall_avg:,.2f}")
 
-    # 額外提供明細下載（可選）
+    st.dataframe(grouped_with_total, use_container_width=True)
+
+    # 明細下載
     with st.expander("下載區間內的明細（依選擇的欄位整理）"):
         cols_to_show = [date_col, views_col, "Tipo"]
         extra_cols = [
-            c
-            for c in ["Page name", "Account name", "Permalink", "Post type", "Content type", "Title"]
+            c for c in ["Page name", "Account name", "Permalink", "Post type", "Content type", "Title"]
             if c in df.columns
         ]
         detail = df[cols_to_show + extra_cols].sort_values(date_col, ascending=False).copy()
@@ -197,7 +211,7 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         st.download_button("下載 CSV", csv, file_name="filtered_details.csv", mime="text/csv")
         st.dataframe(detail.head(50), use_container_width=True)
 
-    # （可選）除錯資訊開關
+    # 除錯資訊（需要時再展開）
     with st.expander("除錯資訊（需要時再展開）"):
         st.write("date_col dtype:", df[date_col].dtype)
         st.write("date_col tz:", getattr(df[date_col].dt, "tz", None))
@@ -210,7 +224,6 @@ if uploaded_file is not None:
     try:
         df = pd.read_csv(uploaded_file)
     except UnicodeDecodeError:
-        # 若是 Excel 匯出的 CSV 可能需要指定編碼
         uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
     except Exception as e:
