@@ -1,14 +1,19 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, time
 from typing import Optional, List
+from zoneinfo import ZoneInfo  # Python 3.9+
 
+# ========= 基本設定 ========= #
 st.set_page_config(page_title="IG / FB Reels 平均觀看分析", layout="centered")
 
 st.title("IG / FB 影片平均觀看數計算")
 st.markdown(
     "上傳 Meta IG 或 FB 報表（CSV），選擇分析期間，自動顯示 Reels 和 Videos 的影片數量、總觀看數、平均觀看數。"
 )
+
+# 你的在地時區（用來轉換與比較）
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
 # 1) 檔案上傳
 uploaded_file = st.file_uploader("上傳 CSV 檔案", type=["csv"])
@@ -90,9 +95,7 @@ def classify_type_fb(row: pd.Series) -> str:
 
 
 def classify_type_ig(row: pd.Series) -> str:
-    post_type = str(
-        row.get("Post type", row.get("Content type", ""))
-    ).lower()
+    post_type = str(row.get("Post type", row.get("Content type", ""))).lower()
     link = str(row.get("Permalink", "")).lower()
     if "reel" in post_type or "/reel" in link:
         return "Reel"
@@ -108,15 +111,22 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
         st.error("找不到日期欄位，請確認報表是否包含 Publish time / Publish date / Created time 等欄位。")
         return
 
+    # **關鍵修正**：統一把日期欄位轉為 tz-aware（先轉 UTC，再轉本地時區）
+    # 這樣不論原本是字串、naive datetime、或帶 Z/offset，都能統一比較
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
-    if df[date_col].isna().all():
+    df = df.dropna(subset=[date_col])  # 清除轉換失敗的列，避免後續比較噴錯
+    if df.empty:
         st.error(f"日期欄位「{date_col}」無法解析為日期時間。")
         return
 
-    # 將使用者選擇的日期區間轉為含當日全日的範圍
-    start_ts = pd.to_datetime(start_d)
-    end_ts = pd.to_datetime(end_d) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    # 轉到本地時區後再做區間篩選（視覺與報表較直覺）
+    df[date_col] = df[date_col].dt.tz_convert(LOCAL_TZ)
 
+    # 將使用者選擇的日期區間轉為「本地時區」的日初/日末（tz-aware）
+    start_ts = pd.Timestamp(datetime.combine(start_d, time.min), tz=LOCAL_TZ)
+    end_ts = pd.Timestamp(datetime.combine(end_d, time.max), tz=LOCAL_TZ)
+
+    # 安全比較（雙方同為 tz-aware 且同一時區）
     df = df[(df[date_col] >= start_ts) & (df[date_col] <= end_ts)]
     if df.empty:
         st.warning("在選定的日期區間內沒有資料。")
@@ -177,11 +187,22 @@ def analyze(df: pd.DataFrame, start_d: date, end_d: date) -> None:
     # 額外提供明細下載（可選）
     with st.expander("下載區間內的明細（依選擇的欄位整理）"):
         cols_to_show = [date_col, views_col, "Tipo"]
-        extra_cols = [c for c in ["Page name", "Account name", "Permalink", "Post type", "Content type", "Title"] if c in df.columns]
+        extra_cols = [
+            c
+            for c in ["Page name", "Account name", "Permalink", "Post type", "Content type", "Title"]
+            if c in df.columns
+        ]
         detail = df[cols_to_show + extra_cols].sort_values(date_col, ascending=False).copy()
         csv = detail.to_csv(index=False).encode("utf-8-sig")
         st.download_button("下載 CSV", csv, file_name="filtered_details.csv", mime="text/csv")
         st.dataframe(detail.head(50), use_container_width=True)
+
+    # （可選）除錯資訊開關
+    with st.expander("除錯資訊（需要時再展開）"):
+        st.write("date_col dtype:", df[date_col].dtype)
+        st.write("date_col tz:", getattr(df[date_col].dt, "tz", None))
+        st.write("start_ts:", start_ts, "tz:", start_ts.tz)
+        st.write("end_ts:", end_ts, "tz:", end_ts.tz)
 
 
 # --------- 主流程 --------- #
